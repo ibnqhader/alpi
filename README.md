@@ -236,9 +236,3 @@ sudo alpi
 If you find any issues or have suggestions for improvements, feel free to open an issue or discuss in wiki, submit a pull request.
 
 ---
-
-## Conclusion
-
-alpi is a powerful tool to manage your system’s package installation, maintenance, and configuration. With a variety of features, it helps automate and streamline the process, making it easier to manage your environment with minimal manual intervention.
-
----
