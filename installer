@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+APP_NAME="alpi"
+SCRIPT_NAME="alpim"
+BIN_DIR="/usr/local/bin"
+CLI_DIR="/usr/local/share"
+INSTALL_DIR="$CLI_DIR/$APP_NAME-cli"
+FILE_PATH="$INSTALL_DIR/$SCRIPT_NAME"
+REPO="https://gitlab.com/ibnqhader/alpi/-/raw/main/src/$SCRIPT_NAME"
+
+YEAR="2025"
+AUTHOR="ibnqhader"
+LICENCE="
+Installer is a script to install $SCRIPT_NAME manager for $APP_NAME!\n
+Copyright (C) $YEAR $AUTHOR\n
+\n
+This program is free software: you can redistribute it and/or modify\n
+it under the terms of the GNU Affero General Public License as published\n
+by the Free Software Foundation, either version 3 of the License, or\n
+(at your option) any later version.\n
+\n
+This program is distributed in the hope that it will be useful,\n
+but WITHOUT ANY WARRANTY; without even the implied warranty of\n
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n
+GNU Affero General Public License for more details.\n
+\n
+You should have received a copy of the GNU Affero General Public License\n
+along with this program.  If not, see https://www.gnu.org/licenses.\n
+"
+
+install() {
+	echo -e "Installing manager $SCRIPT_NAME..."
+	sudo -v
+
+	TMP=$(mktemp)
+	curl -fsSL "$REPO" -o "$TMP" || {
+		echo -e "\033[1;31m[EROR]\033[0m \033[1mFailed to download $SCRIPT_NAME from $REPO\033[0m"
+		exit 1
+	}
+	sudo mkdir -p "$INSTALL_DIR"
+	sudo cp "$TMP" "$FILE_PATH"
+	sudo chmod +x "$FILE_PATH"
+	sudo chmod a-w "$FILE_PATH"
+	sudo ln -sf "$FILE_PATH" "$BIN_DIR"
+	rm -f "$TMP"
+
+	echo -e "\033[1;32m[SUCS]\033[0mInstalled: $SCRIPT_NAME"
+	echo -e "\033[1;34m[INFO]\033[0mYou can now run: $SCRIPT_NAME install"
+}
+
+install
