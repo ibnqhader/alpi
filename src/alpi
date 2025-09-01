@@ -1,0 +1,798 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_NAME="alpi"
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+DEFAULT_PACKAGE_FILE="alpiList"
+PACKAGE_FILES=()
+LOG_FILE="$SCRIPT_DIR/alpiLogs"
+LOCK_FILE=""
+DO_MAINTENANCE=false
+CHECK_AVAILABILITY=false
+CHECK_INSTALLED=false
+CHECK_HEALTH=false
+DRY_RUN=false
+VERBOSE=false
+POST_CLEAN=false
+REMOVE_PACKAGES=false
+INSTALL_PACKAGES=false
+PM=""
+PACKAGES=()
+SUDO_PID=""
+PID=""
+INTERRUPTED=false
+is_config=false
+
+VERSION="1.0.0"
+CONFIG_FILE="alpiConf"
+
+YEAR="2025"
+AUTHOR="ibnqhader"
+INITFILE="$SCRIPT_DIR/.initalpi"
+LICENCE="
+$SCRIPT_NAME is a CLI application script for automating linux package installations across various package managers!\n
+Copyright (C) $YEAR $AUTHOR\n
+\n
+This program is free software: you can redistribute it and/or modify\n
+it under the terms of the GNU Affero General Public License as published\n
+by the Free Software Foundation, either version 3 of the License, or\n
+(at your option) any later version.\n
+\n
+This program is distributed in the hope that it will be useful,\n
+but WITHOUT ANY WARRANTY; without even the implied warranty of\n
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n
+GNU Affero General Public License for more details.\n
+\n
+You should have received a copy of the GNU Affero General Public License\n
+along with this program.  If not, see https://www.gnu.org/licenses.\n
+"
+
+trap 'signal_handle SIGINT' INT
+trap 'signal_handle SIGTERM' TERM
+
+show_licence() {
+	echo -e $LICENCE
+}
+
+initial() {
+	{
+		echo "initial_run=$(date -u)"
+		echo "user=$USER"
+		echo "script=$SCRIPT_NAME"
+		echo "version=$VERSION"
+		echo "shell=$SHELL"
+		echo "os=$(uname -s)"
+		echo "hostname=$(hostname)"
+	} > $INITFILE
+}
+
+if [[ ! -f $INITFILE ]]; then
+	show_licence
+	initial
+	sudo chmod a-w $INITFILE
+fi
+
+if [[ -f "$CONFIG_FILE" ]]; then
+	set -o allexport
+	source "$CONFIG_FILE"
+	set +o allexport
+else
+	is_config=true
+fi
+
+log() {
+	echo -e "\033[1;34m[INFO]\033[0m $*" | sudo tee -a "$LOG_FILE"
+}
+
+eror() {
+	echo -e "\033[1;31m[EROR]\033[0m \033[1m$*\033[0m" | sudo tee -a "$LOG_FILE"
+}
+
+warn() {
+	echo -e "\033[1;33m[WARN]\033[0m $*" | sudo tee -a "$LOG_FILE"
+}
+
+sucs() {
+	echo -e "\033[1;32m[SUCS]\033[0m $*" | sudo tee -a "$LOG_FILE"
+}
+
+infoe() {
+	echo -e "\033[1;34m[INFO]\033[0m $*"
+}
+
+warne() {
+	echo -e "\033[1;33m[WARN]\033[0m $*"
+}
+
+usage() {
+	warne "\033[1mMake sure you configured sources lists files properly for you package manager\033[0m"
+	infoe "\033[1malpi [-m | --maintain] [-H | --health-check] [-a | --availability] [-i | --installed] [-d | --dry-run] \
+	\n\t\t[-I | --install] [-r | --remove] [-c | --post-clean] [-f | --files <file1> <file2> ...] [-C | --configure <file>]\033[0m "
+	echo ""
+	echo "  -m | --maintain           Run package manager maintenance (no package installation)"
+	echo "  -a | --availability       Check availability of packages (without installing)"
+	echo "  -i | --installed          Check if packages are already installed (without installing)"
+	echo "  -d | --dry-run            Show what would be done without actually installing (even without valid package name)"
+	echo "  -H | --health-check       Perform an update and upgrade, space check, fix broken"
+	echo "  -I | --install            Install the given packages (default)"
+	echo "  -r | --remove             Remove and purge given packages rather then installing"
+	echo "  -c | --post-clean         Cleanup and purge unneeded packages from installation"
+	echo -e "  -f | --files              List of package files to install from (default: $DEFAULT_PACKAGE_FILE)"
+	echo -e "  -C | --configure          Configure files (default: $CONFIG_FILE)"
+	echo "  -v | --verbose            Shows variables for configuration environment"
+	echo "  -L | --licence            Shows Licence"
+	echo ""
+	infoe "\033[1mLogs are in '$LOG_FILE'\033[0m"
+	warne "\033[1mPackages list should be in '$DEFAULT_PACKAGE_FILE' (one package per line)\033[0m"
+	infoe "\033[1mPackages can also be accessed by remote file, you can pass URL directly to file flag or place the URL in the packages file\033[0m"
+	exit 1
+}
+
+config() {
+	echo "
+DEFAULT_PACKAGE_FILE=\"$DEFAULT_PACKAGE_FILE\"
+PACKAGE_FILES=()
+LOG_FILE=\"$LOG_FILE\"
+LOCK_FILE=\"$LOCK_FILE\"
+DO_MAINTENANCE=false
+CHECK_AVAILABILITY=false
+CHECK_INSTALLED=false
+CHECK_HEALTH=false
+DRY_RUN=false
+VERBOSE=false
+POST_CLEAN=false
+REMOVE_PACKAGES=false
+INSTALL_PACKAGES=false
+PM=\"$PM\"
+PACKAGES=()
+SUDO_PID=\"$SUDO_PID\"
+PID=\"$PID\"
+"
+	infoe "\033[1mYou can set any of these variables in config file\033[0m"
+	exit 1
+}
+
+require_sudo() {
+	if [[ $EUID -ne 0 ]]; then
+		if ! command -v sudo &>/dev/null; then
+			eror "This script needs to be run as root or have sudo installed."
+			exit 1
+		fi
+	fi
+}
+
+ensure_sudo() {
+	if ! sudo -n true 2>/dev/null; then
+		sudo -v
+		echo
+		log "Sudo credentials cached."
+		( while true; do sudo -n true; sleep 60; done ) &
+		SUDO_PID=$!
+	fi
+}
+
+terminate_sudo() {
+	if [[ -n "$SUDO_PID" ]]; then
+		kill "$SUDO_PID"
+		wait "$SUDO_PID"
+	fi
+}
+
+signal_handle() {
+	local signal="$1"
+	warn "Caught $signal, cleaning up zombies..."
+
+	if [[ -n "$PID" ]]; then
+		kill "$PID"
+		wait "$PID"
+	fi
+
+	terminate_sudo
+
+	INTERRUPTED=true
+}
+
+spinner() {
+	local pid="$1"
+	local msg="${2:-Processing...}"
+	local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+	local i=0
+
+	while kill -0 "$pid" 2>/dev/null; do
+		printf "\r\033[1;30m[%s]\033[0m \033[1;30m%s\033[0m" "${spin:$i:1}" "$msg"
+		i=$(( (i + 1 ) % ${#spin} ))
+		sleep 0.1
+	done
+
+	wait "$pid"
+	local rc=$?
+
+	if [[ $rc -eq 0 ]]; then
+		printf "\r\033[1;30m[✔]\033[0m \033[1;30m%s\033[0m\n" "$msg"
+	else
+		printf "\r\033[1;30m[✖]\033[0m \033[1;30m%s\033[0m failed.\n" "$msg"
+	fi
+}
+
+dry_run() {
+	warn "Dry-run enabled. Packages would not be installed."
+	for pkg in "${PACKAGES[@]}"; do
+		log "Package $pkg would be installed."
+	done
+}
+
+detect_package_manager() {
+	if command -v apt &>/dev/null; then
+		PM="apt"
+		export DEBIAN_FRONTEND=noninteractive
+	elif command -v dnf &>/dev/null; then
+		PM="dnf"
+	elif command -v yum &>/dev/null; then
+		PM="yum"
+	elif command -v pacman &>/dev/null; then
+		PM="pacman"
+	elif command -v zypper &>/dev/null; then
+		PM="zypper"
+	elif command -v brew &>/dev/null; then
+		PM="brew"
+	else
+		eror "Unsupported package manager or OS."
+		exit 1
+	fi
+}
+
+assign_lock_file() {
+	case "$PM" in
+		apt)
+			LOCK_FILE="/var/lib/dpkg/lock-frontend" ;;
+		dnf)
+			LOCK_FILE="/var/run/dnf.pid" ;;
+		yum)
+			LOCK_FILE="/var/run/yum.pid" ;;
+		pacman)
+			LOCK_FILE="/var/lib/pacman/db.lck" ;;
+		zypper)
+			LOCK_FILE="/var/run/zypper.pid" ;;
+		brew)
+			LOCK_FILE="/tmp/homebrew.lock" ;;
+	esac
+}
+
+fetch_packages() {
+	local url="$1"
+	local content=""
+
+	log "Fetching package list from $url..."
+	if content=$(curl -fsL "$url"); then
+		if [[ -n "$content" ]]; then
+				fetch_packages "$content"
+		else
+			warn "Empty content from $url. Skipping."
+		fi
+	else
+		eror "Failed to fetch $url. Skipping."
+	fi
+
+	while IFS= read -r package || [[ -n "$package" ]]; do
+		package="$(echo "$package" | xargs)"
+		if [[ -z "$package" || "$package" == \#* ]]; then
+			continue
+		fi
+		PACKAGES+=("$package")
+	done <<< "$content"
+}
+
+load_packages() {
+	if [[ ${#PACKAGE_FILES[@]} -eq 0 ]]; then
+		PACKAGE_FILES=("$DEFAULT_PACKAGE_FILE")
+	fi
+
+	for file in "${PACKAGE_FILES[@]}"; do
+		if [[ "$file" =~ ^https?:// ]]; then
+			fetch_packages "$file"
+
+		elif [[ -f "$file" ]]; then
+			log "Reading local file: $file"
+			while IFS= read -r line || [[ -n "$line" ]]; do
+				line="$(echo "$line" | xargs)"
+
+				if [[ -z "$line" || "$line" == \#* ]]; then
+					continue
+				fi
+
+				if [[ "$line" =~ ^https?:// ]]; then
+					fetch_packages "$line"
+				else
+					PACKAGES+=("$line")
+				fi
+			done < "$file"
+		else
+			eror "Package list file '$file' not found."
+		fi
+	done
+}
+
+is_container() {
+	if command -v systemd-detect-virt &>/dev/null; then
+		systemd-detect-virt --container --quiet && return 0
+	fi
+	grep -qa 'docker\|lxc' /proc/1/cgroup || grep -qE '(Microsoft|WSL)' /proc/version
+}
+
+is_installed() {
+	local pkg="$1"
+	case "$PM" in
+		apt) dpkg -s $pkg &>/dev/null ;;
+		dnf|yum|zypper) rpm -q $pkg &>/dev/null ;;
+		pacman) pacman -Q $pkg &>/dev/null ;;
+		brew) brew list $pkg &>/dev/null ;;
+	esac
+}
+
+is_available() {
+	local pkg="$1"
+	case "$PM" in
+		apt)
+			if dpkg -l $pkg &>/dev/null; then
+					return 0
+			elif apt-cache show $pkg &>/dev/null; then
+					return 0
+			else
+					return 1
+			fi
+			;;
+		dnf)
+			dnf list available $pkg &>/dev/null && return 0 || return 1 ;;
+		yum)
+			yum list available $pkg &>/dev/null && return 0 || return 1 ;;
+		pacman)
+			pacman -Ss $pkg | grep -q $pkg && return 0 || return 1 ;;
+		zypper)
+			zypper search $pkg &>/dev/null && return 0 || return 1 ;;
+		brew)
+			brew search $pkg &>/dev/null && return 0 || return 1 ;;
+	esac
+}
+
+package_manager_maintenance() {
+
+	if [[ "$PM" != "brew" ]]; then
+		ensure_sudo
+	fi
+
+	case "$PM" in
+		apt)
+			sudo apt update -y &> /dev/null
+			sudo apt upgrade -y &> /dev/null
+			ensure_sudo
+			sudo apt dist-upgrade -y &> /dev/null
+			sudo apt full-upgrade -y &> /dev/null
+			ensure_sudo
+			sudo apt autoremove -y &> /dev/null
+			sudo apt autoclean -y &> /dev/null
+			;;
+		dnf)
+			sudo dnf check-update -y &> /dev/null
+			sudo dnf upgrade -y &> /dev/null
+			ensure_sudo
+			sudo dnf autoremove -y &> /dev/null
+			sudo dnf clean all &> /dev/null
+			;;
+		yum)
+			sudo yum check-update -y &> /dev/null
+			sudo yum update -y &> /dev/null
+			ensure_sudo
+			sudo yum autoremove -y &> /dev/null
+			sudo yum clean all &> /dev/null
+			;;
+		pacman)
+			sudo pacman -Sy &> /dev/null
+			sudo pacman -Syu --noconfirm &> /dev/null
+			ensure_sudo
+			sudo pacman -Rns $(pacman -Qdtq) --noconfirm &> /dev/null
+			sudo pacman -Scc --noconfirm &> /dev/null
+			;;
+		zypper)
+			sudo zypper refresh &> /dev/null
+			sudo zypper update -y &> /dev/null
+			ensure_sudo
+			sudo zypper remove --clean-deps $(zypper packages --orphaned | awk '{print $5}' | tr '\n' ' ') &> /dev/null
+			sudo zypper clean &> /dev/null
+			;;
+		brew)
+			brew update &> /dev/null
+			brew upgrade &> /dev/null
+			brew cleanup &> /dev/null
+			;;
+	esac
+}
+
+system_health_check() {
+
+	if [[ "$PM" != "brew" ]]; then
+		ensure_sudo
+	fi
+
+	local free_space=$(df / | tail -n 1 | awk '{print $4}')
+	if (( free_space < 500000 )); then
+		warn "Low disk space."
+	fi
+
+	case "$PM" in
+		apt)
+			sudo apt update -y &> /dev/null
+			sudo apt upgrade -y &> /dev/null
+			ensure_sudo
+			sudo apt --fix-broken install -y &> /dev/null
+			;;
+		dnf)
+			sudo dnf check-update -y &> /dev/null
+			sudo dnf upgrade -y &> /dev/null
+			ensure_sudo
+			sudo dnf reinstall $(dnf repoquery -a --qf "%{name}") -y &> /dev/null
+			;;
+		yum)
+			sudo yum check-update -y &> /dev/null
+			sudo yum update -y &> /dev/null
+			ensure_sudo
+			sudo yum reinstall $(rpm -qa --qf "%{NAME}\n") -y &> /dev/null
+			;;
+		pacman)
+			sudo pacman -Sy &> /dev/null
+			sudo pacman -Syu --noconfirm &> /dev/null
+			ensure_sudo
+			sudo pacman -Qdtq | sudo pacman -Rns -y &> /dev/null
+			;;
+		zypper)
+			sudo zypper refresh &> /dev/null
+			sudo zypper update -y &> /dev/null
+			ensure_sudo
+			sudo zypper install --force $(zypper search -i | awk '{print $5}' | grep -v 'Package' | tr '\n' ' ') &> /dev/null
+			;;
+		brew)
+			brew update &> /dev/null
+			brew upgrade &> /dev/null
+			brew doctor &> /dev/null
+			;;
+	esac
+}
+
+post_install_cleanup() {
+
+	if [[ "$PM" != "brew" ]]; then
+		ensure_sudo
+	fi
+
+	case "$PM" in
+		apt)
+			sudo apt autoremove --purge -y &> /dev/null
+			sudo apt autoclean -y  &> /dev/null
+			;;
+		dnf)
+			sudo dnf autoremove -y &> /dev/null
+			sudo dnf clean all  &> /dev/null
+			;;
+		yum)
+			sudo yum autoremove -y &> /dev/null
+			sudo yum clean all &> /dev/null
+			;;
+		pacman)
+			sudo pacman -Rns $(pacman -Qdtq) --noconfirm &> /dev/null
+			sudo pacman -Scc --noconfirm &> /dev/null
+			;;
+		zypper)
+			sudo zypper remove --clean-deps $(zypper packages --orphaned | awk '{print $5}' | tr '\n' ' ') &> /dev/null
+			sudo zypper clean &> /dev/null
+			;;
+		brew)
+			brew cleanup &> /dev/null
+			;;
+	esac
+}
+
+install_package() {
+	local pkg="$1"
+
+	assign_lock_file
+
+	if is_installed "$pkg"; then
+		echo
+		log "$pkg is already installed."
+		return 0
+	fi
+
+	if ! is_available "$pkg"; then
+		echo
+		warn "$pkg is NOT available."
+		return 0
+	fi
+
+	echo
+	log "Installing $pkg..."
+
+	if [[ "$PM" != "brew" ]]; then
+		ensure_sudo
+	fi
+
+	case "$PM" in
+		apt)
+			sudo DEBIAN_FRONTEND=noninteractive flock -x "$LOCK_FILE" -c "apt-get install -y $pkg" &> /dev/null
+			;;
+		dnf)
+			sudo flock -x "$LOCK_FILE" -c "dnf install -y $pkg" &> /dev/null
+			;;
+		yum)
+			sudo flock -x "$LOCK_FILE" -c "yum install -y $pkg" &> /dev/null
+			;;
+		pacman)
+			sudo flock -x "$LOCK_FILE" -c "pacman -Sy --noconfirm $pkg" &> /dev/null
+			;;
+		zypper)
+			sudo flock -x "$LOCK_FILE" -c "zypper --non-interactive install -y $pkg" &> /dev/null
+			;;
+		brew)
+			flock -x "$LOCK_FILE" -c "brew install $pkg" &> /dev/null
+			;;
+	esac
+
+	wait
+}
+
+remove_package() {
+	local pkg="$1"
+
+	assign_lock_file
+
+	echo
+	log "Removing $pkg..."
+
+	if [[ "$PM" != "brew" ]]; then
+		ensure_sudo
+	fi
+
+	case "$PM" in
+		apt)
+			sudo flock -x "$LOCK_FILE" -c "apt-get remove --purge -y $pkg"  &> /dev/null
+			;;
+		dnf)
+			sudo flock -x "$LOCK_FILE" -c "dnf remove -y $pkg" &> /dev/null
+			;;
+		yum)
+			sudo flock -x "$LOCK_FILE" -c "yum remove -y $pkg" &> /dev/null
+			;;
+		pacman)
+			sudo flock -x "$LOCK_FILE" -c "pacman -Rns --noconfirm $pkg" &> /dev/null
+			;;
+		zypper)
+			sudo flock -x "$LOCK_FILE" -c "zypper remove --clean-deps -y $pkg" &> /dev/null
+			;;
+		brew)
+			flock -x "$LOCK_FILE" -c "brew uninstall $pkg" &> /dev/null
+			;;
+	esac
+
+	wait
+}
+
+parallel_processing() {
+	local pkgs=("$@")
+	local funcIOR=install_package
+
+	if [[ "$REMOVE_PACKAGES" == true ]]; then
+		funcIOR=remove_package
+		export -f remove_package
+	else
+		export -f install_package
+	fi
+
+	EXPOF="log eror sucs warn is_installed is_available ensure_sudo assign_lock_file"
+	for fn in $EXPOF; do
+		export -f "$fn"
+	done
+
+	export PM LOG_FILE
+
+	if [[ "$PM" != "brew" ]]; then
+		ensure_sudo
+	fi
+
+	if command -v parallel &>/dev/null; then
+		log "Using GNU Parallel for parallel process."
+		printf "%s\n" "${pkgs[@]}" | parallel -j 4 $funcIOR &
+		PID=$!
+	else
+		log "GNU Parallel not found. Attempting to install it."
+		if install_package "parallel" &>/dev/null; then
+			log "GNU Parallel successfully installed."
+			printf "%s\n" "${pkgs[@]}" | parallel -j 4 $funcIOR &
+			PID=$!
+		else
+			if command -v xargs &>/dev/null; then
+				log "Using xargs for parallel process (fallback)."
+				printf "%s\n" "${pkgs[@]}" | xargs -n 1 -P 4 $funcIOR &
+				PID=$!
+			else
+				log "xargs not found. Attempting to install xargs."
+				if install_package "findutils" &>/dev/null; then
+					log "xargs successfully installed."
+					printf "%s\n" "${pkgs[@]}" | xargs -n 1 -P 4 $funcIOR &
+					PID=$!
+				else
+					log "Parallel process not available, processing packages serially."
+					for pkg in "${pkgs[@]}"; do
+						(
+							$funcIOR "$pkg"
+						) &
+						PID=$!
+						spinner "$PID" "Installing $pkg ..."
+						wait "$PID"
+					done
+				fi
+			fi
+		fi
+	fi
+
+	spinner "$PID" "Performing parallel packages..."
+	wait "$PID"
+
+	log "post-install cleanup..."
+	post_install_cleanup &
+	PID=$!
+	spinner "$PID" "post installation cleanup..."
+
+}
+
+parse_args() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			-m|--maintain)
+				DO_MAINTENANCE=true
+				shift
+				;;
+			-a|--availability)
+				CHECK_AVAILABILITY=true
+				shift
+				;;
+			-i|--installed)
+				CHECK_INSTALLED=true
+				shift
+				;;
+			-d|--dry-run)
+				DRY_RUN=true
+				shift
+				;;
+			-f|--files)
+				shift
+				PACKAGE_FILES=()
+				while [[ $# -gt 0 ]] && [[ "$1" != "--" ]] && [[ "$1" != -* ]]; do
+					PACKAGE_FILES+=("$1")
+					shift
+				done
+				;;
+			-C|--configure)
+				shift
+				while [[ $# -gt 0 ]] && [[ "$1" != "--" ]] && [[ "$1" != -* ]]; do
+					CONFIG_FILE="$1"
+					shift
+				done
+				;;
+			-H|--health-check)
+				CHECK_HEALTH=true
+				shift
+				;;
+			-I|--install)
+				INSTALL_PACKAGES=true
+				shift
+				;;
+			-r|--remove)
+				REMOVE_PACKAGES=true
+				shift
+				;;
+			-c|--post-clean)
+				POST_CLEAN=true
+				shift
+				;;
+			-v|--verbose)
+				config
+				;;
+			-L|--licence)
+				show_licence
+				exit 0
+				;;
+			-h|--help)
+				usage
+				;;
+			*)
+				eror "Unknown option: $1"
+				usage
+				;;
+		esac
+	done
+}
+
+main() {
+	parse_args "$@"
+	require_sudo
+	detect_package_manager
+	load_packages
+
+	if [[ "$CHECK_INSTALLED" == true ]]; then
+		log "Checking packages are installed..."
+		for pkg in "${PACKAGES[@]}"; do
+			if is_installed "$pkg"; then
+				log "$pkg is already installed."
+			else
+				warn "$pkg is NOT installed."
+			fi
+		done
+	fi
+
+	if [[ "$CHECK_AVAILABILITY" == true ]]; then
+		log "Checking package availability..."
+		for pkg in "${PACKAGES[@]}"; do
+			if is_available "$pkg"; then
+				log "$pkg is available."
+			else
+				warn "$pkg is NOT available."
+			fi
+		done
+	fi
+
+	if [[ "$DO_MAINTENANCE" == true ]]; then
+		log "Running full package manager maintenance..."
+		package_manager_maintenance &
+		PID=$!
+		spinner "$PID" "Maintenance..."
+	fi
+
+	if [[ "$CHECK_HEALTH" == true ]]; then
+		log "Performing system health check..."
+		system_health_check &
+		PID=$!
+		spinner "$PID" "Health check..."
+	fi
+
+	if [[ "$REMOVE_PACKAGES" == true ]]; then
+		log "Performing packages removal..."
+	else
+		log "Running package installation..."
+	fi
+
+	if [[ "$POST_CLEAN" == true ]]; then
+		log "Performing post cleanup..."
+		post_install_cleanup &
+		PID=$!
+		spinner "$PID" "Post cleanup..."
+	fi
+
+	if [[ "$DRY_RUN" == true ]]; then
+		log "Performing dry run..."
+		dry_run
+	fi
+
+	if is_container; then
+		warn "Running in container — disabling services restart"
+	fi
+
+	if [[ "$DRY_RUN" == false ]] && [[ "$INSTALL_PACKAGES" == true ]] || [[ "$REMOVE_PACKAGES" == true ]] || [[ $# -eq 0 ]]; then
+		if [[ "$is_config" ]]; then
+			warne "Config file '$CONFIG_FILE' not found. Using defaults."
+		fi
+		warn "Recommended doing the 'Health Check' or 'Maintenance' before installation. Proceeding..."
+		parallel_processing "${PACKAGES[@]}"
+	fi
+
+	if [[ "$INTERRUPTED" == true ]]; then
+		eror "Installation interrupted by user."
+		warn "You may need to run 'sudo dpkg --configure -a' or similar command, before re-run the script"
+	else
+		terminate_sudo
+
+		sucs "All processes processed successfully."
+	fi
+}
+
+main "$@"
