@@ -1,0 +1,101 @@
+# System Tools and Utilities
+jq
+ssh
+curl
+wget
+unzip
+aria2
+ffmpeg
+gnupg2
+openssl
+xfsprogs
+dos2unix
+libavif-bin
+
+# Development Tools
+git
+vim
+gcc
+llvm
+nano
+clang
+postgis
+python3
+libpq-dev
+postgresql
+default-jdk
+python3-dev
+python3-venv
+build-essential
+
+# Web Servers and Databases
+nginx
+uwsgi
+nginx-full
+uwsgi-emperor
+default-mysql-client
+default-mysql-server
+uwsgi-plugin-python3
+
+# Web Browsers
+brave-browser
+firefox-esr
+chromium
+
+# Media Tools
+gimp
+shotcut
+audacity
+
+# Office and Productivity
+libreoffice
+cherrytree
+
+# Icon Themes and UI
+papirus-icon-theme
+xfce4-genmon-plugin
+
+# ADB Tools
+adb
+
+# Virtualization & Containerization
+lxd
+
+# Debugging & Profiling
+gdb
+lldb
+ghidra
+
+# Security & Networking
+tor
+torsocks
+openvpn
+openresolv
+proxychains4
+
+amass
+sqlmap
+hashcat
+gobuster
+theharvester
+metasploit-framework
+
+# Core Printing System
+cups
+cups-pdf
+cups-filters
+cups-browsed
+
+# Core Scanning System
+xsane
+sane-utils
+
+# General & Manufacturer Drivers
+print-manager
+printer-driver-all
+system-config-printer
+
+# Forensics Tools
+forensics-full
+forensics-extra
+forensics-extra-gui
